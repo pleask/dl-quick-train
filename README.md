@@ -1,2 +1,2 @@
 # dl-quick-train
-Experimental faster training for dictionary learning on single machines
+Experimental faster training for dictionary learning on single GPU machines.
