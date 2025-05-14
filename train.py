@@ -318,7 +318,7 @@ def run_pipeline(
 
 if __name__ == "__main__":
     steps = 100_000
-    device = "mps"
+    device = "cuda"
     run_pipeline(
         [
             dict(
