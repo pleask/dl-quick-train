@@ -2,6 +2,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import traceback
 
 import torch
 import torch as t  # Hate this - leftover from dl
@@ -15,8 +16,19 @@ from transformers import AutoTokenizer
 
 import wandb
 
+MAX_ERRORS = 5
 
-def input_fetcher(q, model_name, dataset_name, steps, batch_size, max_length, device):
+
+def input_fetcher(
+    q,
+    model_name,
+    dataset_name,
+    steps,
+    batch_size,
+    max_length,
+    device,
+    max_errors: int = MAX_ERRORS,
+):
     dataset = load_dataset(dataset_name, streaming=True, split="train")
     loader = DataLoader(
         dataset,
@@ -32,43 +44,75 @@ def input_fetcher(q, model_name, dataset_name, steps, batch_size, max_length, de
     tok.backend_tokenizer.enable_padding(
         length=max_length, pad_id=tok.pad_token_id, pad_token=tok.pad_token
     )
+    errors = 0
     with tqdm(total=steps, desc="Training...") as pbar:
-        for i, batch in enumerate(loader):
-            if i >= steps:
-                break
-            inputs = tok(
-                batch["text"],
-                return_tensors="pt",
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-            )
-            inputs = {
-                k: v.to("cpu", non_blocking=True).share_memory_()
-                for k, v in inputs.items()
-            }
-            q.put(inputs)
-            pbar.update(1)
+        iterator = iter(loader)
+        i = 0
+        while i < steps:
+            try:
+                batch = next(iterator)
+                inputs = tok(
+                    batch["text"],
+                    return_tensors="pt",
+                    padding="max_length",
+                    max_length=max_length,
+                    truncation=True,
+                )
+                inputs = {
+                    k: v.to("cpu", non_blocking=True).share_memory_()
+                    for k, v in inputs.items()
+                }
+                q.put(inputs)
+                pbar.update(1)
+                i += 1
+            except Exception as e:
+                errors += 1
+                traceback.print_exc()
+                if errors >= max_errors:
+                    print("input_fetcher: too many errors, exiting")
+                    break
+                else:
+                    print("input_fetcher: error encountered, skipping batch")
+                    continue
     q.put("DONE")
 
 
-def activation_fetcher(in_q, out_q, model_name, submodule, ctx_len, device):
+def activation_fetcher(
+    in_q,
+    out_q,
+    model_name,
+    submodule,
+    ctx_len,
+    device,
+    max_errors: int = MAX_ERRORS,
+):
     model = LanguageModel(model_name, device_map=device)
     model.eval()
     submodule = eval(f"model.{submodule}")  # caller decides string
 
+    errors = 0
     while True:
         try:
             inputs = in_q.get(timeout=1)
-            if inputs == "DONE":
-                break
+        except queue.Empty:
+            continue
+        if inputs == "DONE":
+            break
+        try:
             with torch.inference_mode():
                 with model.trace(inputs, invoker_args={"max_length": ctx_len}):
                     h = submodule.output.save()
                     submodule.output.stop()
                 out_q.put(h.value.to("cpu", non_blocking=True).share_memory_())
-        except queue.Empty:
-            continue
+        except Exception:
+            errors += 1
+            traceback.print_exc()
+            if errors >= max_errors:
+                print("activation_fetcher: too many errors, exiting")
+                break
+            else:
+                print("activation_fetcher: error encountered, skipping batch")
+                continue
     out_q.put("DONE")
 
 
@@ -152,6 +196,7 @@ def train(
     log_steps,
     verbose,
     save_steps,
+    max_errors: int = MAX_ERRORS,
 ):
     wandb_processes = []
     log_queues = []
@@ -200,11 +245,15 @@ def train(
 
     print("Starting training...")
     step = 0
+    errors = 0
     while True:
         try:
             act = q.get(timeout=1)
-            if act == "DONE":
-                break
+        except queue.Empty:
+            continue
+        if act == "DONE":
+            break
+        try:
             for t in trainers:
                 if (use_wandb or verbose) and step % log_steps == 0:
                     log_stats(
@@ -220,7 +269,7 @@ def train(
                 if save_steps is not None and step in save_steps:
                     for dir, trainer in zip(save_dirs, trainers):
                         if dir is not None:
-
+                            
                             # TODO: re-enable
                             # if normalize_activations:
                             #     # Temporarily scale up biases for checkpoint saving
@@ -244,8 +293,15 @@ def train(
                 for trainer in trainers:
                     trainer.update(step, act)
             step += 1
-        except queue.Empty:
-            continue
+        except Exception:
+            errors += 1
+            traceback.print_exc()
+            if errors >= max_errors:
+                print("train: too many errors, exiting")
+                break
+            else:
+                print("train: error encountered, skipping batch")
+                continue
 
     # Signal wandb processes to finish
     if use_wandb:
@@ -277,6 +333,7 @@ def run_pipeline(
     log_steps=100,
     verbose=False,
     save_steps=None,
+    max_errors: int = MAX_ERRORS,
 ):
     if dictionary_size is None:
         dictionary_size = 16 * activation_dim
@@ -287,11 +344,20 @@ def run_pipeline(
     procs = [
         mp.Process(
             target=input_fetcher,
-            args=(in_q, model_name, dataset_name, steps, batch_size, seq_len, device),
+            args=(
+                in_q,
+                model_name,
+                dataset_name,
+                steps,
+                batch_size,
+                seq_len,
+                device,
+                max_errors,
+            ),
         ),
         mp.Process(
             target=activation_fetcher,
-            args=(in_q, act_q, model_name, submodule, seq_len, device),
+            args=(in_q, act_q, model_name, submodule, seq_len, device, max_errors),
         ),
         mp.Process(
             target=train,
@@ -306,6 +372,7 @@ def run_pipeline(
                 log_steps,
                 verbose,
                 save_steps,
+                max_errors,
             ),
         ),
     ]
