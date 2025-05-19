@@ -383,7 +383,8 @@ def run_pipeline(
         p.join()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Run the default training pipeline."""
     steps = 100_000
     device = "cuda"
     run_pipeline(
@@ -408,3 +409,7 @@ if __name__ == "__main__":
         use_wandb=False,
         device=device,
     )
+
+
+if __name__ == "__main__":
+    main()
