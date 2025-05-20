@@ -345,6 +345,150 @@ def train(
             process.join()
 
 
+def _run_single_process(
+    trainer_configs,
+    *,
+    device="cuda:0",
+    model_name="EleutherAI/pythia-70m-deduped",
+    submodule=None,
+    dataset_name="HuggingFaceFW/fineweb",
+    steps=100_000,
+    batch_size=128,
+    seq_len=32,
+    run_cfg={},
+    use_wandb=False,
+    wandb_entity=None,
+    wandb_project=None,
+    save_dir=None,
+    log_steps=100,
+    verbose=False,
+    save_steps=None,
+    max_errors: int = MAX_ERRORS,
+):
+    """Run the entire pipeline in a single process."""
+    faulthandler.enable()
+
+    dataset = load_dataset(dataset_name, streaming=True, split="train")
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=4,
+        prefetch_factor=8,
+        persistent_workers=True,
+    )
+
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    tok.pad_token = tok.eos_token
+    tok.pad_token_id = tok.eos_token_id
+    tok.backend_tokenizer.enable_truncation(max_length=seq_len)
+    tok.backend_tokenizer.enable_padding(
+        length=seq_len, pad_id=tok.pad_token_id, pad_token=tok.pad_token
+    )
+
+    model = LanguageModel(model_name, device_map=device)
+    model.eval()
+    submodule_ref = eval(f"model.{submodule}")
+
+    # Setup trainers and wandb processes
+    trainers = []
+    wandb_processes = []
+    log_queues = []
+    for cfg in trainer_configs:
+        cls = cfg.pop("trainer")
+        trainers.append(cls(**cfg))
+
+    if use_wandb:
+        for i, trainer in enumerate(trainers):
+            log_queue = mp.Queue(32)
+            log_queues.append(log_queue)
+            wandb_config = trainer.config | run_cfg
+            wandb_config = {
+                k: v.cpu().item() if isinstance(v, torch.Tensor) else v
+                for k, v in wandb_config.items()
+            }
+            p = mp.Process(
+                target=new_wandb_process,
+                args=(wandb_config, log_queue, wandb_entity, wandb_project),
+            )
+            p.start()
+            wandb_processes.append(p)
+
+    if save_dir is not None:
+        save_dirs = [
+            os.path.join(save_dir, f"trainer_{i}") for i in range(len(trainer_configs))
+        ]
+        for trainer, dir in zip(trainers, save_dirs):
+            os.makedirs(dir, exist_ok=True)
+            config = {"trainer": trainer.config}
+            with open(os.path.join(dir, "config.json"), "w") as f:
+                json.dump(config, f, indent=4)
+    else:
+        save_dirs = [None for _ in trainer_configs]
+
+    iterator = iter(loader)
+    errors = 0
+    step = 0
+    with tqdm(total=steps, desc="Training...") as pbar:
+        while step < steps:
+            try:
+                batch = next(iterator)
+                inputs = tok(
+                    batch["text"],
+                    return_tensors="pt",
+                    padding="max_length",
+                    max_length=seq_len,
+                    truncation=True,
+                )
+                inputs = {k: v.to("cpu", non_blocking=True) for k, v in inputs.items()}
+
+                with torch.inference_mode():
+                    with model.trace(inputs, invoker_args={"max_length": seq_len}):
+                        h = submodule_ref.output.save()
+                        submodule_ref.output.stop()
+                    act = h.value.to("cpu", non_blocking=True)
+
+                for tnr in trainers:
+                    if (use_wandb or verbose) and step % log_steps == 0:
+                        log_stats(
+                            trainers,
+                            step,
+                            act,
+                            False,
+                            False,
+                            log_queues=log_queues,
+                            verbose=verbose,
+                        )
+
+                    if save_steps is not None and step in save_steps:
+                        for dir, trainer in zip(save_dirs, trainers):
+                            if dir is None:
+                                continue
+                            if not os.path.exists(os.path.join(dir, "checkpoints")):
+                                os.mkdir(os.path.join(dir, "checkpoints"))
+                            checkpoint = {k: v.cpu() for k, v in trainer.ae.state_dict().items()}
+                            torch.save(
+                                checkpoint,
+                                os.path.join(dir, "checkpoints", f"ae_{step}.pt"),
+                            )
+
+                    tnr.update(step, act)
+
+                step += 1
+                pbar.update(1)
+            except Exception:
+                errors += 1
+                traceback.print_exc()
+                if errors >= max_errors:
+                    raise
+                else:
+                    continue
+
+    if use_wandb:
+        for q in log_queues:
+            q.put("DONE")
+        for p in wandb_processes:
+            p.join()
+
 def run_pipeline(
     trainer_configs,
     *,
@@ -369,92 +513,115 @@ def run_pipeline(
     save_steps=None,
     max_errors: int = MAX_ERRORS,
     start_method: str = "forkserver",
+    multiprocess: bool = True,
 ):
     if dictionary_size is None:
         dictionary_size = 16 * activation_dim
 
     mp.set_start_method(start_method, force=True)  # avoids CUDA fork issues
-    in_q, act_q = mp.Queue(queue_size), mp.Queue(queue_size)
-    error_q = mp.Queue()
 
-    procs = [
-        mp.Process(
-            name="input_fetcher",
-            target=input_fetcher,
-            args=(
-                in_q,
-                model_name,
-                dataset_name,
-                steps,
-                batch_size,
-                seq_len,
-                device,
-                max_errors,
-                error_q,
+    if multiprocess:
+        in_q, act_q = mp.Queue(queue_size), mp.Queue(queue_size)
+        error_q = mp.Queue()
+
+        procs = [
+            mp.Process(
+                name="input_fetcher",
+                target=input_fetcher,
+                args=(
+                    in_q,
+                    model_name,
+                    dataset_name,
+                    steps,
+                    batch_size,
+                    seq_len,
+                    device,
+                    max_errors,
+                    error_q,
+                ),
             ),
-        ),
-        mp.Process(
-            name="activation_fetcher",
-            target=activation_fetcher,
-            args=(
-                in_q,
-                act_q,
-                model_name,
-                submodule,
-                seq_len,
-                device,
-                max_errors,
-                error_q,
+            mp.Process(
+                name="activation_fetcher",
+                target=activation_fetcher,
+                args=(
+                    in_q,
+                    act_q,
+                    model_name,
+                    submodule,
+                    seq_len,
+                    device,
+                    max_errors,
+                    error_q,
+                ),
             ),
-        ),
-        mp.Process(
-            name="train",
-            target=train,
-            args=(
-                act_q,
-                trainer_configs,
-                run_cfg,
-                use_wandb,
-                wandb_entity,
-                wandb_project,
-                save_dir,
-                log_steps,
-                verbose,
-                save_steps,
-                max_errors,
-                error_q,
+            mp.Process(
+                name="train",
+                target=train,
+                args=(
+                    act_q,
+                    trainer_configs,
+                    run_cfg,
+                    use_wandb,
+                    wandb_entity,
+                    wandb_project,
+                    save_dir,
+                    log_steps,
+                    verbose,
+                    save_steps,
+                    max_errors,
+                    error_q,
+                ),
             ),
-        ),
-    ]
+        ]
 
-    for p in procs:
-        p.start()
-
-    alive = procs.copy()
-    try:
-        while alive:
-            try:
-                while True:
-                    proc_name, tb = error_q.get_nowait()
-                    print(f"[Error in {proc_name}]", file=sys.stderr)
-                    print(tb, file=sys.stderr)
-            except queue.Empty:
-                pass
-
-            for p in list(alive):
-                p.join(timeout=0.1)
-                if not p.is_alive():
-                    if p.exitcode != 0:
-                        raise RuntimeError(
-                            f"Process {p.name} exited with code {p.exitcode}"
-                        )
-                    alive.remove(p)
-    finally:
-        for p in alive:
-            if p.is_alive():
-                p.terminate()
         for p in procs:
-            p.join()
+            p.start()
+
+        alive = procs.copy()
+        try:
+            while alive:
+                try:
+                    while True:
+                        proc_name, tb = error_q.get_nowait()
+                        print(f"[Error in {proc_name}]", file=sys.stderr)
+                        print(tb, file=sys.stderr)
+                except queue.Empty:
+                    pass
+
+                for p in list(alive):
+                    p.join(timeout=0.1)
+                    if not p.is_alive():
+                        if p.exitcode != 0:
+                            raise RuntimeError(
+                                f"Process {p.name} exited with code {p.exitcode}"
+                            )
+                        alive.remove(p)
+        finally:
+            for p in alive:
+                if p.is_alive():
+                    p.terminate()
+            for p in procs:
+                p.join()
+    else:
+        _run_single_process(
+            trainer_configs,
+            device=device,
+            model_name=model_name,
+            submodule=submodule,
+            dataset_name=dataset_name,
+            steps=steps,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            run_cfg=run_cfg,
+            use_wandb=use_wandb,
+            wandb_entity=wandb_entity,
+            wandb_project=wandb_project,
+            save_dir=save_dir,
+            log_steps=log_steps,
+            verbose=verbose,
+            save_steps=save_steps,
+            max_errors=max_errors,
+        )
 
 
 def main() -> None:
