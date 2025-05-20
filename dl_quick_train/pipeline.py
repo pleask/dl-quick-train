@@ -2,6 +2,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import sys
 import traceback
 
 import torch
@@ -28,6 +29,7 @@ def input_fetcher(
     max_length,
     device,
     max_errors: int = MAX_ERRORS,
+    error_queue: mp.Queue | None = None,
 ):
     dataset = load_dataset(dataset_name, streaming=True, split="train")
     loader = DataLoader(
@@ -67,10 +69,15 @@ def input_fetcher(
                 i += 1
             except Exception as e:
                 errors += 1
+                tb = traceback.format_exc()
+                if error_queue is not None:
+                    error_queue.put(("input_fetcher", tb))
                 traceback.print_exc()
                 if errors >= max_errors:
                     print("input_fetcher: too many errors, exiting")
-                    break
+                    if error_queue is not None:
+                        error_queue.put(("input_fetcher", "too many errors"))
+                    sys.exit(1)
                 else:
                     print("input_fetcher: error encountered, skipping batch")
                     continue
@@ -85,6 +92,7 @@ def activation_fetcher(
     ctx_len,
     device,
     max_errors: int = MAX_ERRORS,
+    error_queue: mp.Queue | None = None,
 ):
     model = LanguageModel(model_name, device_map=device)
     model.eval()
@@ -106,10 +114,15 @@ def activation_fetcher(
                 out_q.put(h.value.to("cpu", non_blocking=True).share_memory_())
         except Exception:
             errors += 1
+            tb = traceback.format_exc()
+            if error_queue is not None:
+                error_queue.put(("activation_fetcher", tb))
             traceback.print_exc()
             if errors >= max_errors:
                 print("activation_fetcher: too many errors, exiting")
-                break
+                if error_queue is not None:
+                    error_queue.put(("activation_fetcher", "too many errors"))
+                sys.exit(1)
             else:
                 print("activation_fetcher: error encountered, skipping batch")
                 continue
@@ -197,6 +210,7 @@ def train(
     verbose,
     save_steps,
     max_errors: int = MAX_ERRORS,
+    error_queue: mp.Queue | None = None,
 ):
     wandb_processes = []
     log_queues = []
@@ -295,10 +309,15 @@ def train(
             step += 1
         except Exception:
             errors += 1
+            tb = traceback.format_exc()
+            if error_queue is not None:
+                error_queue.put(("train", tb))
             traceback.print_exc()
             if errors >= max_errors:
                 print("train: too many errors, exiting")
-                break
+                if error_queue is not None:
+                    error_queue.put(("train", "too many errors"))
+                sys.exit(1)
             else:
                 print("train: error encountered, skipping batch")
                 continue
@@ -340,9 +359,11 @@ def run_pipeline(
 
     mp.set_start_method("forkserver", force=True)  # avoids CUDA fork issues
     in_q, act_q = mp.Queue(queue_size), mp.Queue(queue_size)
+    error_q = mp.Queue()
 
     procs = [
         mp.Process(
+            name="input_fetcher",
             target=input_fetcher,
             args=(
                 in_q,
@@ -353,13 +374,25 @@ def run_pipeline(
                 seq_len,
                 device,
                 max_errors,
+                error_q,
             ),
         ),
         mp.Process(
+            name="activation_fetcher",
             target=activation_fetcher,
-            args=(in_q, act_q, model_name, submodule, seq_len, device, max_errors),
+            args=(
+                in_q,
+                act_q,
+                model_name,
+                submodule,
+                seq_len,
+                device,
+                max_errors,
+                error_q,
+            ),
         ),
         mp.Process(
+            name="train",
             target=train,
             args=(
                 act_q,
@@ -373,14 +406,39 @@ def run_pipeline(
                 verbose,
                 save_steps,
                 max_errors,
+                error_q,
             ),
         ),
     ]
 
     for p in procs:
         p.start()
-    for p in procs:
-        p.join()
+
+    alive = procs.copy()
+    try:
+        while alive:
+            try:
+                while True:
+                    proc_name, tb = error_q.get_nowait()
+                    print(f"[Error in {proc_name}]", file=sys.stderr)
+                    print(tb, file=sys.stderr)
+            except queue.Empty:
+                pass
+
+            for p in list(alive):
+                p.join(timeout=0.1)
+                if not p.is_alive():
+                    if p.exitcode != 0:
+                        raise RuntimeError(
+                            f"Process {p.name} exited with code {p.exitcode}"
+                        )
+                    alive.remove(p)
+    finally:
+        for p in alive:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join()
 
 
 def main() -> None:
