@@ -4,6 +4,7 @@ import os
 import queue
 import sys
 import traceback
+import faulthandler
 
 import torch
 import torch as t  # Hate this - leftover from dl
@@ -31,6 +32,7 @@ def input_fetcher(
     max_errors: int = MAX_ERRORS,
     error_queue: mp.Queue | None = None,
 ):
+    faulthandler.enable()
     dataset = load_dataset(dataset_name, streaming=True, split="train")
     loader = DataLoader(
         dataset,
@@ -94,6 +96,7 @@ def activation_fetcher(
     max_errors: int = MAX_ERRORS,
     error_queue: mp.Queue | None = None,
 ):
+    faulthandler.enable()
     model = LanguageModel(model_name, device_map=device)
     model.eval()
     submodule = eval(f"model.{submodule}")  # caller decides string
@@ -104,6 +107,14 @@ def activation_fetcher(
             inputs = in_q.get(timeout=1)
         except queue.Empty:
             continue
+        except (EOFError, ConnectionResetError, BrokenPipeError):
+            msg = (
+                "activation_fetcher: lost connection to input_fetcher (possible crash)"
+            )
+            if error_queue is not None:
+                error_queue.put(("activation_fetcher", msg))
+            print(msg, file=sys.stderr)
+            return
         if inputs == "DONE":
             break
         try:
@@ -112,6 +123,12 @@ def activation_fetcher(
                     h = submodule.output.save()
                     submodule.output.stop()
                 out_q.put(h.value.to("cpu", non_blocking=True).share_memory_())
+        except (EOFError, ConnectionResetError, BrokenPipeError):
+            msg = "activation_fetcher: lost connection to train (possible crash)"
+            if error_queue is not None:
+                error_queue.put(("activation_fetcher", msg))
+            print(msg, file=sys.stderr)
+            return
         except Exception:
             errors += 1
             tb = traceback.format_exc()
@@ -212,6 +229,7 @@ def train(
     max_errors: int = MAX_ERRORS,
     error_queue: mp.Queue | None = None,
 ):
+    faulthandler.enable()
     wandb_processes = []
     log_queues = []
 
@@ -223,9 +241,6 @@ def train(
 
     if use_wandb:
         print("Starting wandb processes...")
-        # Note: If encountering wandb and CUDA related errors, try setting start method to spawn in the if __name__ == "__main__" block
-        # https://docs.python.org/3/library/multiprocessing.html#multiprocessing.set_start_method
-        # Everything should work fine with the default fork method but it may not be as robust
         for i, trainer in enumerate(trainers):
             log_queue = mp.Queue(32)
             log_queues.append(log_queue)
@@ -353,11 +368,12 @@ def run_pipeline(
     verbose=False,
     save_steps=None,
     max_errors: int = MAX_ERRORS,
+    start_method: str = "forkserver",
 ):
     if dictionary_size is None:
         dictionary_size = 16 * activation_dim
 
-    mp.set_start_method("forkserver", force=True)  # avoids CUDA fork issues
+    mp.set_start_method(start_method, force=True)  # avoids CUDA fork issues
     in_q, act_q = mp.Queue(queue_size), mp.Queue(queue_size)
     error_q = mp.Queue()
 
@@ -466,6 +482,7 @@ def main() -> None:
         batch_size=128,
         use_wandb=False,
         device=device,
+        start_method="forkserver",
     )
 
 
