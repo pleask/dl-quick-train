@@ -181,6 +181,8 @@ def log_stats(
 
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
+                # Number of unique SAE features active in the batch
+                unique_active = (f != 0).any(dim=0).sum().item()
                 # fraction of variance explained
                 total_variance = torch.var(act, dim=0).sum()
                 residual_variance = torch.var(act - act_hat, dim=0).sum()
@@ -191,6 +193,8 @@ def log_stats(
 
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
+                # Number of unique SAE features active in the batch
+                unique_active = (f != 0).any(dim=0).sum().item()
 
             if verbose:
                 print(
@@ -205,6 +209,7 @@ def log_stats(
                 }
             )
             log[f"l0"] = l0
+            log["unique_active_features"] = unique_active
             trainer_log = trainer.get_logging_parameters()
             for name, value in trainer_log.items():
                 if isinstance(value, torch.Tensor):
