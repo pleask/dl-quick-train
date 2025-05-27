@@ -30,7 +30,7 @@ def input_fetcher(
     max_length,
     device,
     max_errors: int = MAX_ERRORS,
-    error_queue: mp.Queue | None = None,
+    error_queue: mp.Queue = None,
 ):
     faulthandler.enable()
     dataset = load_dataset(dataset_name, streaming=True, split="train")
@@ -94,7 +94,7 @@ def activation_fetcher(
     ctx_len,
     device,
     max_errors: int = MAX_ERRORS,
-    error_queue: mp.Queue | None = None,
+    error_queue: mp.Queue = None,
 ):
     faulthandler.enable()
     model = LanguageModel(model_name, device_map=device)
@@ -232,7 +232,7 @@ def train(
     verbose,
     save_steps,
     max_errors: int = MAX_ERRORS,
-    error_queue: mp.Queue | None = None,
+    error_queue: mp.Queue = None,
 ):
     faulthandler.enable()
     wandb_processes = []
