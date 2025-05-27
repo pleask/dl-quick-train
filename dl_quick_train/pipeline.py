@@ -182,7 +182,11 @@ def log_stats(
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
                 # Number of unique SAE features active in the batch
-                unique_active = (f != 0).any(dim=0).sum().item()
+                # f can be shape (batch, seq, features) or (batch, features)
+                active_mask = f != 0
+                if active_mask.ndim > 2:
+                    active_mask = active_mask.reshape(-1, active_mask.shape[-1])
+                unique_active = active_mask.any(dim=0).sum().item()
                 # fraction of variance explained
                 total_variance = torch.var(act, dim=0).sum()
                 residual_variance = torch.var(act - act_hat, dim=0).sum()
@@ -194,7 +198,10 @@ def log_stats(
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
                 # Number of unique SAE features active in the batch
-                unique_active = (f != 0).any(dim=0).sum().item()
+                active_mask = f != 0
+                if active_mask.ndim > 2:
+                    active_mask = active_mask.reshape(-1, active_mask.shape[-1])
+                unique_active = active_mask.any(dim=0).sum().item()
 
             if verbose:
                 print(
