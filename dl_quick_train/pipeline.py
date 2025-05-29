@@ -163,7 +163,14 @@ def new_wandb_process(
             log = log_queue.get(timeout=1)
             if log == "DONE":
                 break
-            wandb.log(log)
+            if isinstance(log, dict):
+                wandb.log(log)
+            elif isinstance(log, tuple) and log[0] == "artifact":
+                artifact_path = log[1]
+                artifact_name = os.path.basename(artifact_path)
+                artifact = wandb.Artifact(artifact_name, type="model")
+                artifact.add_file(artifact_path)
+                run.log_artifact(artifact)
         except queue.Empty:
             continue
     wandb.finish()
@@ -292,11 +299,11 @@ def train(
         save_dirs = [
             os.path.join(save_dir, f"trainer_{i}") for i in range(len(trainer_configs))
         ]
-        for trainer, dir in zip(trainers, save_dirs):
-            os.makedirs(dir, exist_ok=True)
+        for trainer, trainer_dir in zip(trainers, save_dirs):
+            os.makedirs(trainer_dir, exist_ok=True)
             # save config
             config = {"trainer": trainer.config}
-            with open(os.path.join(dir, "config.json"), "w") as f:
+            with open(os.path.join(trainer_dir, "config.json"), "w") as f:
                 print(config)
                 json.dump(config, f, indent=4)
     else:
@@ -326,24 +333,27 @@ def train(
                     )
 
                 if save_steps is not None and step in save_steps:
-                    for dir, trainer in zip(save_dirs, trainers):
-                        if dir is not None:
+                    for idx, (trainer_dir, trainer) in enumerate(zip(save_dirs, trainers)):
+                        if trainer_dir is not None:
                             
                             # TODO: re-enable
                             # if normalize_activations:
                             #     # Temporarily scale up biases for checkpoint saving
                             #     trainer.ae.scale_biases(norm_factor)
 
-                            if not os.path.exists(os.path.join(dir, "checkpoints")):
-                                os.mkdir(os.path.join(dir, "checkpoints"))
+                            if not os.path.exists(os.path.join(trainer_dir, "checkpoints")):
+                                os.mkdir(os.path.join(trainer_dir, "checkpoints"))
 
                             checkpoint = {
                                 k: v.cpu() for k, v in trainer.ae.state_dict().items()
                             }
+                            path = os.path.join(trainer_dir, "checkpoints", f"ae_{step}.pt")
                             torch.save(
                                 checkpoint,
-                                os.path.join(dir, "checkpoints", f"ae_{step}.pt"),
+                                path,
                             )
+                            if use_wandb:
+                                log_queues[idx].put(("artifact", path))
 
                             # TODO: re-enable
                             # if normalize_activations:
@@ -457,10 +467,10 @@ def _run_single_process(
         save_dirs = [
             os.path.join(save_dir, f"trainer_{i}") for i in range(len(trainer_configs))
         ]
-        for trainer, dir in zip(trainers, save_dirs):
-            os.makedirs(dir, exist_ok=True)
+        for trainer, trainer_dir in zip(trainers, save_dirs):
+            os.makedirs(trainer_dir, exist_ok=True)
             config = {"trainer": trainer.config}
-            with open(os.path.join(dir, "config.json"), "w") as f:
+            with open(os.path.join(trainer_dir, "config.json"), "w") as f:
                 json.dump(config, f, indent=4)
     else:
         save_dirs = [None for _ in trainer_configs]
@@ -500,16 +510,19 @@ def _run_single_process(
                         )
 
                     if save_steps is not None and step in save_steps:
-                        for dir, trainer in zip(save_dirs, trainers):
-                            if dir is None:
+                        for idx, (trainer_dir, trainer) in enumerate(zip(save_dirs, trainers)):
+                            if trainer_dir is None:
                                 continue
-                            if not os.path.exists(os.path.join(dir, "checkpoints")):
-                                os.mkdir(os.path.join(dir, "checkpoints"))
+                            if not os.path.exists(os.path.join(trainer_dir, "checkpoints")):
+                                os.mkdir(os.path.join(trainer_dir, "checkpoints"))
                             checkpoint = {k: v.cpu() for k, v in trainer.ae.state_dict().items()}
+                            path = os.path.join(trainer_dir, "checkpoints", f"ae_{step}.pt")
                             torch.save(
                                 checkpoint,
-                                os.path.join(dir, "checkpoints", f"ae_{step}.pt"),
+                                path,
                             )
+                            if use_wandb:
+                                log_queues[idx].put(("artifact", path))
 
                     tnr.update(step, act)
 
