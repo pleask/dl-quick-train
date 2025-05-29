@@ -5,6 +5,7 @@ import queue
 import sys
 import traceback
 import faulthandler
+from typing import Optional
 
 import torch
 import torch as t  # Hate this - leftover from dl
@@ -146,8 +147,17 @@ def activation_fetcher(
     out_q.put("DONE")
 
 
-def new_wandb_process(config, log_queue, entity, project):
-    wandb.init(entity=entity, project=project, config=config, name=config["wandb_name"])
+def new_wandb_process(
+    config,
+    log_queue,
+    entity,
+    project,
+    run_id_queue=None,
+    index=None,
+):
+    run = wandb.init(entity=entity, project=project, config=config, name=config["wandb_name"])
+    if run_id_queue is not None:
+        run_id_queue.put((index, run.id))
     while True:
         try:
             log = log_queue.get(timeout=1)
@@ -240,6 +250,7 @@ def train(
     save_steps,
     max_errors: int = MAX_ERRORS,
     error_queue: mp.Queue = None,
+    run_id_queue: Optional[mp.Queue] = None,
 ):
     faulthandler.enable()
     wandb_processes = []
@@ -264,7 +275,14 @@ def train(
             }
             wandb_process = mp.Process(
                 target=new_wandb_process,
-                args=(wandb_config, log_queue, wandb_entity, wandb_project),
+                args=(
+                    wandb_config,
+                    log_queue,
+                    wandb_entity,
+                    wandb_project,
+                    run_id_queue,
+                    i,
+                ),
             )
             wandb_process.start()
             wandb_processes.append(wandb_process)
@@ -376,6 +394,7 @@ def _run_single_process(
     verbose=False,
     save_steps=None,
     max_errors: int = MAX_ERRORS,
+    run_id_queue: Optional[mp.Queue] = None,
 ):
     """Run the entire pipeline in a single process."""
     faulthandler.enable()
@@ -405,6 +424,8 @@ def _run_single_process(
     trainers = []
     wandb_processes = []
     log_queues = []
+    if use_wandb and run_id_queue is None:
+        run_id_queue = mp.Queue()
     for cfg in trainer_configs:
         cls = cfg.pop("trainer")
         trainers.append(cls(**cfg))
@@ -420,7 +441,14 @@ def _run_single_process(
             }
             p = mp.Process(
                 target=new_wandb_process,
-                args=(wandb_config, log_queue, wandb_entity, wandb_project),
+                args=(
+                    wandb_config,
+                    log_queue,
+                    wandb_entity,
+                    wandb_project,
+                    run_id_queue,
+                    i,
+                ),
             )
             p.start()
             wandb_processes.append(p)
@@ -500,6 +528,13 @@ def _run_single_process(
             q.put("DONE")
         for p in wandb_processes:
             p.join()
+        run_ids = [None] * len(trainer_configs)
+        for _ in range(len(trainer_configs)):
+            idx, r_id = run_id_queue.get()
+            run_ids[idx] = r_id
+    else:
+        run_ids = []
+    return run_ids
 
 def run_pipeline(
     trainer_configs,
@@ -531,6 +566,7 @@ def run_pipeline(
         dictionary_size = 16 * activation_dim
 
     mp.set_start_method(start_method, force=True)  # avoids CUDA fork issues
+    run_id_queue = mp.Queue() if use_wandb else None
 
     if multiprocess:
         in_q, act_q = mp.Queue(queue_size), mp.Queue(queue_size)
@@ -582,6 +618,7 @@ def run_pipeline(
                     save_steps,
                     max_errors,
                     error_q,
+                    run_id_queue,
                 ),
             ),
         ]
@@ -614,8 +651,15 @@ def run_pipeline(
                     p.terminate()
             for p in procs:
                 p.join()
+        if use_wandb:
+            run_ids = [None] * len(trainer_configs)
+            for _ in range(len(trainer_configs)):
+                idx, r_id = run_id_queue.get()
+                run_ids[idx] = r_id
+        else:
+            run_ids = []
     else:
-        _run_single_process(
+        run_ids = _run_single_process(
             trainer_configs,
             device=device,
             model_name=model_name,
@@ -633,7 +677,9 @@ def run_pipeline(
             verbose=verbose,
             save_steps=save_steps,
             max_errors=max_errors,
+            run_id_queue=run_id_queue,
         )
+    return run_ids
 
 
 def main() -> None:
