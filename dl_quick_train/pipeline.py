@@ -440,6 +440,9 @@ def _run_single_process(
         cls = cfg.pop("trainer")
         trainers.append(cls(**cfg))
 
+    for trainer in trainers:
+        trainer.ae.to(device)
+
     if use_wandb:
         for i, trainer in enumerate(trainers):
             log_queue = mp.Queue(32)
@@ -495,7 +498,11 @@ def _run_single_process(
                     with model.trace(inputs, invoker_args={"max_length": seq_len}):
                         h = submodule_ref.output.save()
                         submodule_ref.output.stop()
-                    act = h.value.to("cpu", non_blocking=True)
+                    try:
+                        act = h.value.to("cpu", non_blocking=True)
+                    except AttributeError:
+                        # Handle case where h.value is a tuple
+                        act = h.value[0].to("cpu", non_blocking=True)
 
                 for tnr in trainers:
                     if (use_wandb or verbose) and step % log_steps == 0:
