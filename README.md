@@ -26,8 +26,10 @@ run_pipeline([...], activation_cache_dir="/tmp/activations")
 ```
 
 Setting `activation_cache_dir` enables caching of model activations on disk.
-If the directory already contains cached activations for the requested
-configuration, they will be loaded instead of recomputed.
+Caches are stored in subdirectories determined by the model name, dataset,
+layer, activation dimension, submodule and sequence length. If the directory
+already contains cached activations for the requested configuration they will
+be loaded instead of recomputed.
 
 `run_pipeline` accepts a `start_method` argument controlling the
 multiprocessing start method (default: `"forkserver"`). Crash reporting is
