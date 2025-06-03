@@ -3,6 +3,7 @@
 from .pipeline import (
     input_fetcher,
     activation_fetcher,
+    activation_loader,
     new_wandb_process,
     log_stats,
     train,
@@ -13,6 +14,7 @@ from .pipeline import (
 __all__ = [
     "input_fetcher",
     "activation_fetcher",
+    "activation_loader",
     "new_wandb_process",
     "log_stats",
     "train",

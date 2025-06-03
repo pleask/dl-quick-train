@@ -94,6 +94,7 @@ def activation_fetcher(
     submodule,
     ctx_len,
     device,
+    cache_dir=None,
     max_errors: int = MAX_ERRORS,
     error_queue: mp.Queue = None,
 ):
@@ -101,6 +102,11 @@ def activation_fetcher(
     model = LanguageModel(model_name, device_map=device)
     model.eval()
     submodule = eval(f"model.{submodule}")  # caller decides string
+
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    step_idx = 0
 
     errors = 0
     while True:
@@ -123,7 +129,12 @@ def activation_fetcher(
                 with model.trace(inputs, invoker_args={"max_length": ctx_len}):
                     h = submodule.output.save()
                     submodule.output.stop()
-                out_q.put(h.value.to("cpu", non_blocking=True).share_memory_())
+                act = h.value.to("cpu", non_blocking=True)
+                out_q.put(act.share_memory_())
+
+            if cache_dir is not None:
+                torch.save(act, os.path.join(cache_dir, f"{step_idx}.pt"))
+                step_idx += 1
         except (EOFError, ConnectionResetError, BrokenPipeError):
             msg = "activation_fetcher: lost connection to train (possible crash)"
             if error_queue is not None:
@@ -144,6 +155,15 @@ def activation_fetcher(
             else:
                 print("activation_fetcher: error encountered, skipping batch")
                 continue
+    out_q.put("DONE")
+
+
+def activation_loader(out_q, cache_dir, steps):
+    """Load cached activations from disk and feed them into the pipeline."""
+    faulthandler.enable()
+    for i in range(steps):
+        act = torch.load(os.path.join(cache_dir, f"{i}.pt"))
+        out_q.put(act.share_memory_())
     out_q.put("DONE")
 
 
@@ -395,6 +415,7 @@ def _run_single_process(
     steps=100_000,
     batch_size=128,
     seq_len=32,
+    activation_cache_dir=None,
     run_cfg={},
     use_wandb=False,
     wandb_entity=None,
@@ -409,26 +430,35 @@ def _run_single_process(
     """Run the entire pipeline in a single process."""
     faulthandler.enable()
 
-    dataset = load_dataset(dataset_name, streaming=True, split="train")
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=4,
-        prefetch_factor=8,
-        persistent_workers=True,
+    cache_exists = (
+        activation_cache_dir is not None
+        and os.path.exists(os.path.join(activation_cache_dir, f"{steps-1}.pt"))
     )
 
-    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    tok.pad_token = tok.eos_token
-    tok.pad_token_id = tok.eos_token_id
-    tok.backend_tokenizer.enable_truncation(max_length=seq_len)
-    tok.backend_tokenizer.enable_padding(
-        length=seq_len, pad_id=tok.pad_token_id, pad_token=tok.pad_token
-    )
+    if not cache_exists:
+        dataset = load_dataset(dataset_name, streaming=True, split="train")
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=4,
+            prefetch_factor=8,
+            persistent_workers=True,
+        )
 
-    model = LanguageModel(model_name, device_map=device)
-    model.eval()
-    submodule_ref = eval(f"model.{submodule}")
+        tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        tok.pad_token = tok.eos_token
+        tok.pad_token_id = tok.eos_token_id
+        tok.backend_tokenizer.enable_truncation(max_length=seq_len)
+        tok.backend_tokenizer.enable_padding(
+            length=seq_len, pad_id=tok.pad_token_id, pad_token=tok.pad_token
+        )
+
+        model = LanguageModel(model_name, device_map=device)
+        model.eval()
+        submodule_ref = eval(f"model.{submodule}")
+        iterator = iter(loader)
+        if activation_cache_dir is not None:
+            os.makedirs(activation_cache_dir, exist_ok=True)
 
     # Setup trainers and wandb processes
     trainers = []
@@ -478,31 +508,41 @@ def _run_single_process(
     else:
         save_dirs = [None for _ in trainer_configs]
 
-    iterator = iter(loader)
+    if cache_exists:
+        iterator = None
+    else:
+        iterator = iter(loader)
     errors = 0
     step = 0
     with tqdm(total=steps, desc="Training...") as pbar:
         while step < steps:
             try:
-                batch = next(iterator)
-                inputs = tok(
-                    batch["text"],
-                    return_tensors="pt",
-                    padding="max_length",
-                    max_length=seq_len,
-                    truncation=True,
-                )
-                inputs = {k: v.to("cpu", non_blocking=True) for k, v in inputs.items()}
+                if cache_exists:
+                    act = torch.load(
+                        os.path.join(activation_cache_dir, f"{step}.pt"),
+                        map_location="cpu",
+                    )
+                else:
+                    batch = next(iterator)
+                    inputs = tok(
+                        batch["text"],
+                        return_tensors="pt",
+                        padding="max_length",
+                        max_length=seq_len,
+                        truncation=True,
+                    )
+                    inputs = {k: v.to("cpu", non_blocking=True) for k, v in inputs.items()}
 
-                with torch.inference_mode():
-                    with model.trace(inputs, invoker_args={"max_length": seq_len}):
-                        h = submodule_ref.output.save()
-                        submodule_ref.output.stop()
-                    try:
-                        act = h.value.to("cpu", non_blocking=True)
-                    except AttributeError:
-                        # Handle case where h.value is a tuple
-                        act = h.value[0].to("cpu", non_blocking=True)
+                    with torch.inference_mode():
+                        with model.trace(inputs, invoker_args={"max_length": seq_len}):
+                            h = submodule_ref.output.save()
+                            submodule_ref.output.stop()
+                        try:
+                            act = h.value.to("cpu", non_blocking=True)
+                        except AttributeError:
+                            act = h.value[0].to("cpu", non_blocking=True)
+                    if activation_cache_dir is not None:
+                        torch.save(act, os.path.join(activation_cache_dir, f"{step}.pt"))
 
                 for tnr in trainers:
                     if (use_wandb or verbose) and step % log_steps == 0:
@@ -569,6 +609,7 @@ def run_pipeline(
     steps=100_000,
     batch_size=128,
     seq_len=32,
+    activation_cache_dir=None,
     queue_size=32,
     run_cfg={},
     use_wandb=False,
@@ -589,59 +630,95 @@ def run_pipeline(
     run_id_queue = mp.Queue() if use_wandb else None
 
     if multiprocess:
-        in_q, act_q = mp.Queue(queue_size), mp.Queue(queue_size)
         error_q = mp.Queue()
+        use_cache = (
+            activation_cache_dir is not None
+            and os.path.exists(os.path.join(activation_cache_dir, f"{steps-1}.pt"))
+        )
 
-        procs = [
-            mp.Process(
-                name="input_fetcher",
-                target=input_fetcher,
-                args=(
-                    in_q,
-                    model_name,
-                    dataset_name,
-                    steps,
-                    batch_size,
-                    seq_len,
-                    device,
-                    max_errors,
-                    error_q,
+        if use_cache:
+            act_q = mp.Queue(queue_size)
+            procs = [
+                mp.Process(
+                    name="activation_loader",
+                    target=activation_loader,
+                    args=(act_q, activation_cache_dir, steps),
                 ),
-            ),
-            mp.Process(
-                name="activation_fetcher",
-                target=activation_fetcher,
-                args=(
-                    in_q,
-                    act_q,
-                    model_name,
-                    submodule,
-                    seq_len,
-                    device,
-                    max_errors,
-                    error_q,
+                mp.Process(
+                    name="train",
+                    target=train,
+                    args=(
+                        act_q,
+                        trainer_configs,
+                        run_cfg,
+                        use_wandb,
+                        wandb_entity,
+                        wandb_project,
+                        save_dir,
+                        log_steps,
+                        verbose,
+                        save_steps,
+                        max_errors,
+                        error_q,
+                        run_id_queue,
+                    ),
                 ),
-            ),
-            mp.Process(
-                name="train",
-                target=train,
-                args=(
-                    act_q,
-                    trainer_configs,
-                    run_cfg,
-                    use_wandb,
-                    wandb_entity,
-                    wandb_project,
-                    save_dir,
-                    log_steps,
-                    verbose,
-                    save_steps,
-                    max_errors,
-                    error_q,
-                    run_id_queue,
+            ]
+        else:
+            in_q, act_q = mp.Queue(queue_size), mp.Queue(queue_size)
+            if activation_cache_dir is not None:
+                os.makedirs(activation_cache_dir, exist_ok=True)
+            procs = [
+                mp.Process(
+                    name="input_fetcher",
+                    target=input_fetcher,
+                    args=(
+                        in_q,
+                        model_name,
+                        dataset_name,
+                        steps,
+                        batch_size,
+                        seq_len,
+                        device,
+                        max_errors,
+                        error_q,
+                    ),
                 ),
-            ),
-        ]
+                mp.Process(
+                    name="activation_fetcher",
+                    target=activation_fetcher,
+                    args=(
+                        in_q,
+                        act_q,
+                        model_name,
+                        submodule,
+                        seq_len,
+                        device,
+                        activation_cache_dir,
+                        max_errors,
+                        error_q,
+                    ),
+                ),
+                mp.Process(
+                    name="train",
+                    target=train,
+                    args=(
+                        act_q,
+                        trainer_configs,
+                        run_cfg,
+                        use_wandb,
+                        wandb_entity,
+                        wandb_project,
+                        save_dir,
+                        log_steps,
+                        verbose,
+                        save_steps,
+                        max_errors,
+                        error_q,
+                        run_id_queue,
+                    ),
+                ),
+            ]
 
         for p in procs:
             p.start()
@@ -698,6 +775,7 @@ def run_pipeline(
             save_steps=save_steps,
             max_errors=max_errors,
             run_id_queue=run_id_queue,
+            activation_cache_dir=activation_cache_dir,
         )
     return run_ids
 
