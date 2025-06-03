@@ -22,6 +22,34 @@ import wandb
 MAX_ERRORS = 5
 
 
+def _sanitize_for_path(value: str) -> str:
+    """Sanitize a string so it can be used as a directory name."""
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in str(value))
+
+
+def get_cache_dir(
+    base_dir: str,
+    model_name: str,
+    layer: int,
+    activation_dim: int,
+    submodule: Optional[str],
+    dataset_name: str,
+    seq_len: int,
+) -> str:
+    """Return a unique cache directory path for the given configuration."""
+    parts = [
+        _sanitize_for_path(model_name),
+        _sanitize_for_path(dataset_name),
+        f"layer{layer}",
+        f"dim{activation_dim}",
+        f"seq{seq_len}",
+    ]
+    if submodule is not None:
+        parts.insert(2, _sanitize_for_path(submodule))
+    name = "__".join(parts)
+    return os.path.join(base_dir, name)
+
+
 def input_fetcher(
     q,
     model_name,
@@ -429,7 +457,6 @@ def _run_single_process(
 ):
     """Run the entire pipeline in a single process."""
     faulthandler.enable()
-
     cache_exists = (
         activation_cache_dir is not None
         and os.path.exists(os.path.join(activation_cache_dir, f"{steps-1}.pt"))
@@ -628,6 +655,17 @@ def run_pipeline(
 
     mp.set_start_method(start_method, force=True)  # avoids CUDA fork issues
     run_id_queue = mp.Queue() if use_wandb else None
+
+    if activation_cache_dir is not None:
+        activation_cache_dir = get_cache_dir(
+            activation_cache_dir,
+            model_name,
+            layer,
+            activation_dim,
+            submodule,
+            dataset_name,
+            seq_len,
+        )
 
     if multiprocess:
         error_q = mp.Queue()
