@@ -5,6 +5,7 @@ import queue
 import sys
 import traceback
 import faulthandler
+import time
 from typing import Optional
 
 import torch
@@ -98,6 +99,23 @@ def input_fetcher(
                 q.put(inputs)
                 pbar.update(1)
                 i += 1
+            except TimeoutError:
+                errors += 1
+                tb = traceback.format_exc()
+                if error_queue is not None:
+                    error_queue.put(("input_fetcher", tb))
+                traceback.print_exc()
+                if errors >= max_errors:
+                    print("input_fetcher: too many errors, exiting")
+                    if error_queue is not None:
+                        error_queue.put(("input_fetcher", "too many errors"))
+                    sys.exit(1)
+                else:
+                    print(
+                        "input_fetcher: TimeoutError encountered, waiting 15 minutes before retry"
+                    )
+                    time.sleep(60 * 15)
+                    continue
             except Exception as e:
                 errors += 1
                 tb = traceback.format_exc()
