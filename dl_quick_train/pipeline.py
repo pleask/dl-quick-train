@@ -34,7 +34,8 @@ def new_wandb_process(
             if log == "DONE":
                 break
             if isinstance(log, dict):
-                wandb.log(log)
+                step = log.pop("step", None)
+                wandb.log(log, step=step)
             elif isinstance(log, tuple) and log[0] == "artifact":
                 artifact_path = log[1]
                 artifact_name = os.path.basename(artifact_path)
@@ -104,6 +105,7 @@ def log_stats(
             )
             log[f"l0"] = l0
             log["unique_active_features"] = unique_active
+            log["step"] = step
             trainer_log = trainer.get_logging_parameters()
             for name, value in trainer_log.items():
                 if isinstance(value, torch.Tensor):
