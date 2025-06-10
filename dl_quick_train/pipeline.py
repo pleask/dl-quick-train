@@ -1,4 +1,5 @@
 import json
+from functools import partial
 import multiprocessing as mp
 import os
 import queue
@@ -116,6 +117,17 @@ def log_stats(
                 log_queues[i].put(log)
 
 
+def collate(batch, tok, seq_len):
+    # tok comes from parent, safe to pickle; do the heavy work here
+    return tok(
+        [ex["text"] for ex in batch],
+        padding="max_length",
+        truncation=True,
+        max_length=seq_len,
+        return_tensors="pt",
+    )["input_ids"]
+
+
 def run_pipeline(
     trainer_configs,
     *,
@@ -136,6 +148,7 @@ def run_pipeline(
     save_steps=None,
     **kwargs,
 ):
+    mp.set_start_method("spawn", force=True)
     model = LanguageModel(model_name, device_map=device)
     dataset = load_dataset(dataset_name, streaming=True, split="train")
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
@@ -154,16 +167,6 @@ def run_pipeline(
         trainer.ae = trainer.ae.to(device)
         trainers.append(trainer)
 
-    def collate(batch):
-        # tokenize inside worker so tokenisation and I/O overlap GPU
-        out = tok(
-            [ex["text"] for ex in batch],
-            padding="max_length",
-            max_length=seq_len,
-            truncation=True,
-            return_tensors="pt",
-        )
-        return out["input_ids"]
 
     loader = DataLoader(
         dataset,
@@ -171,7 +174,7 @@ def run_pipeline(
         num_workers=4,
         prefetch_factor=8,
         persistent_workers=True,
-        collate_fn=collate,
+        collate_fn=partial(collate, tok=tok, seq_len=seq_len),
     )
     loader = iter(loader)
 
