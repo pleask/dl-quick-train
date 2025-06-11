@@ -9,6 +9,7 @@ from datasets import load_dataset
 from dictionary_learning import AutoEncoder
 from dictionary_learning.trainers import StandardTrainer
 from nnsight import LanguageModel
+from transformer_lens import HookedTransformer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -140,6 +141,7 @@ def run_pipeline(
     seq_len=32,
     run_cfg={},
     use_wandb=False,
+    use_transformer_lens=False,
     wandb_entity=None,
     wandb_project=None,
     save_dir=None,
@@ -149,7 +151,10 @@ def run_pipeline(
     **kwargs,
 ):
     mp.set_start_method("spawn", force=True)
-    model = LanguageModel(model_name, device_map=device)
+    if use_transformer_lens:
+        model = HookedTransformer.from_pretrained(model_name, device=device)
+    else:
+        model = LanguageModel(model_name, device_map=device)
     dataset = load_dataset(dataset_name, streaming=True, split="train")
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     tok.pad_token = tok.eos_token
@@ -158,7 +163,9 @@ def run_pipeline(
     tok.backend_tokenizer.enable_padding(
         length=seq_len, pad_id=tok.pad_token_id, pad_token=tok.pad_token
     )
-    submodule_ref = eval(f"model.{submodule}")
+
+    if not use_transformer_lens:
+        submodule_ref = eval(f"model.{submodule}")
 
     trainers = []
     for cfg in trainer_configs:
@@ -220,12 +227,20 @@ def run_pipeline(
     for step in tqdm(range(steps), desc="Training"):
         batch = next(loader)
         with torch.cuda.stream(stream):
-            with torch.no_grad(), model.trace(
-                batch.to(device), invoker_args={"max_length": seq_len}
-            ):
-                h = submodule_ref.output.save()
-                submodule_ref.output.stop()
-        act = h.value[0]
+            with torch.no_grad():
+                if use_transformer_lens:
+                    _, cache = model.run_with_cache(
+                        batch.to(device),
+                        names_filter=[submodule],
+                    )
+                    act = cache[submodule]
+                else:
+                    with model.trace(
+                        batch.to(device), invoker_args={"max_length": seq_len}
+                    ):
+                        h = submodule_ref.output.save()
+                        submodule_ref.output.stop()
+                    act = h.value[0]
 
         for tnr in trainers:
             if (use_wandb or verbose) and step % log_steps == 0:

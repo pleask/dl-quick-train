@@ -25,6 +25,10 @@ from dl_quick_train import run_pipeline
 run_pipeline([...], activation_cache_dir="/tmp/activations")
 ```
 
+Set `use_transformer_lens=True` to collect activations with
+[TransformerLens](https://github.com/TransformerOptimus/TransformerLens)
+instead of `nnsight`.
+
 Setting `activation_cache_dir` enables caching of model activations on disk.
 Caches are stored in subdirectories determined by the model name, dataset,
 layer, activation dimension, submodule and sequence length. If the directory

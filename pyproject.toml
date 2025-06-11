@@ -17,6 +17,7 @@ dependencies = [
     "nnsight",
     "tqdm",
     "transformers",
+    "transformer-lens",
     "wandb",
 ]
 
