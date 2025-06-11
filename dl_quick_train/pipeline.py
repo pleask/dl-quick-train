@@ -142,6 +142,7 @@ def run_pipeline(
     run_cfg={},
     use_wandb=False,
     use_transformer_lens=False,
+    stop_at_layer=None,
     wandb_entity=None,
     wandb_project=None,
     save_dir=None,
@@ -232,6 +233,7 @@ def run_pipeline(
                     _, cache = model.run_with_cache(
                         batch.to(device),
                         names_filter=[submodule],
+                        stop_at_layer=stop_at_layer,
                     )
                     act = cache[submodule]
                 else:
