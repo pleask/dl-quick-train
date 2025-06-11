@@ -4,4 +4,5 @@ dictionary-learning
 nnsight
 tqdm
 transformers
+transformer-lens
 wandb
