@@ -5,7 +5,7 @@ import os
 import queue
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig
 from dictionary_learning import AutoEncoder
 from dictionary_learning.trainers import StandardTrainer
 from nnsight import LanguageModel
@@ -154,10 +154,11 @@ def run_pipeline(
     mp.set_start_method("spawn", force=True)
     if use_transformer_lens:
         model = HookedTransformer.from_pretrained(model_name, device=device)
+        tok = model.tokenizer
     else:
         model = LanguageModel(model_name, device_map=device)
-    dataset = load_dataset(dataset_name, streaming=True, split="train")
-    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    dataset = load_dataset(dataset_name, streaming=True, split="train", download_config=DownloadConfig(max_retries=100, resume_download=True))
     tok.pad_token = tok.eos_token
     tok.pad_token_id = tok.eos_token_id
     tok.backend_tokenizer.enable_truncation(max_length=seq_len)
