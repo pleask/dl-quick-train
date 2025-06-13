@@ -245,7 +245,6 @@ def run_pipeline(
                         submodule_ref.output.stop()
                     act = h.value[0]
 
-        for tnr in trainers:
             if (use_wandb or verbose) and step % log_steps == 0:
                 log_stats(
                     trainers,
@@ -274,7 +273,8 @@ def run_pipeline(
                     if use_wandb:
                         log_queues[idx].put(("artifact", path))
 
-            tnr.update(step, act)
+            for tnr in trainers:
+                tnr.update(step, act)
 
     if use_wandb:
         for q in log_queues:
