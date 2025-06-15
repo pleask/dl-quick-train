@@ -158,7 +158,7 @@ def run_pipeline(
     else:
         model = LanguageModel(model_name, device_map=device)
         tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    dataset = load_dataset(dataset_name, streaming=True, split="train", download_config=DownloadConfig(max_retries=100, resume_download=True))
+    dataset = load_dataset(dataset_name, split="train")
     tok.pad_token = tok.eos_token
     tok.pad_token_id = tok.eos_token_id
     tok.backend_tokenizer.enable_truncation(max_length=seq_len)
