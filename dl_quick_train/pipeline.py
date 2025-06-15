@@ -135,7 +135,7 @@ def run_pipeline(
     device="cuda:0",
     model_name="EleutherAI/pythia-70m-deduped",
     submodule=None,
-    dataset_name="HuggingFaceFW/fineweb",
+    dataset_name="monology/pile-uncopyrighted",
     steps=100_000,
     batch_size=128,
     seq_len=32,
