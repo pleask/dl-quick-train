@@ -180,9 +180,6 @@ def run_pipeline(
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        num_workers=4,
-        prefetch_factor=8,
-        persistent_workers=True,
         collate_fn=partial(collate, tok=tok, seq_len=seq_len),
     )
     loader = iter(loader)
